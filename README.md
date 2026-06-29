@@ -1490,6 +1490,77 @@ authorization hold so we never instruct the PSP to disburse funds the merchant
 doesn't have under concurrent in-flight pay-outs. Across many wallets/shards, pay-out
 scales fine; a single wallet needing >2,000 pay-out TPS is not a realistic case.
 
+### Sharding scales the platform — not a single hot wallet
+
+I want to be precise about what sharding does and doesn't buy, because it's the most
+common confusion I hear. Sharding by `company_id` distributes *different* wallets
+across shards — but **one wallet lives on exactly one shard**, so it still hits that
+shard's single-writer ceiling. A single hot wallet is a **hot-key / hot-row** problem,
+not a distribution problem, and you can't distribute your way out of it. Adding more
+supermarket checkouts does nothing for the one customer trying to ring up 10,000 items
+at a single register.
+
+For a single wallet there are two very different cases, and conflating them is where
+most reasoning goes wrong:
+
+- **Pay-in (credit) — already mostly solved.** Credits are lock-free appends to
+  `ledger_entries` (the append-only ledger, [§4.3](#43-the-append-only-ledger)). There
+  is no hot row; the only limit is the shard writer's insert/WAL throughput (~5k). For
+  a single wallet that's rarely the problem.
+- **Pay-out (debit) — the real wall.** Every debit takes a per-wallet advisory lock
+  plus an overdraft check (two concurrent debits must not both pass the balance check
+  and overdraw the same wallet), so they serialize → **~1,100–2,000 per wallet** even
+  with the batcher. That is the physical limit of a single wallet, and no amount of
+  sharding moves it.
+
+If you genuinely had to make *one* wallet sustain very high pay-out TPS, there are
+three techniques, from simplest to most powerful:
+
+- **(a) Atomic conditional decrement.**
+  `UPDATE wallets SET available = available - :amt WHERE available >= :amt` removes the
+  *explicit* lock — the check and the decrement become one atomic statement — but it
+  still serializes on the same row (the hot row is still there), so you get a few
+  thousand per second. Better, not enough.
+- **(b) Sharded balance counter — the real hot-wallet fix.** Split *one* wallet's
+  balance into N sub-balance buckets (rows):
+  `wallet_balance_buckets(wallet_id, bucket_no, available)`. A debit picks a bucket
+  (round-robin or hash) and atomically decrements *that* bucket, so the single
+  wallet's load spreads across N rows → roughly N× throughput. The total balance is
+  `SUM(buckets)`. The cost is honest: a debit can fail on an empty bucket while the
+  *total* is still sufficient, so you need a fallback (try another bucket) plus
+  periodic rebalancing across buckets. This is the classic "sharded counter" pattern
+  for scaling a single hot counter — applied here to a single hot balance.
+- **(c) Redis atomic reservation — the fastest.** Hold the wallet's `available` in
+  Redis and run the debit as an atomic Lua "reserve if enough"
+  (`if available >= amt then DECRBY ...`). Single-threaded Redis makes that
+  check-then-decrement atomic without any DB lock — ~50,000–100,000 ops/s, versus the
+  ~1,000–2,000/s a PostgreSQL row lock can sustain. PostgreSQL remains the durable
+  ledger (written after, batched, no lock); Redis is just the fast guard at the front.
+  The trade-off, stated plainly: you must (1) seed the Redis `available` from PG, (2)
+  reconcile if the PG write lags or crashes, and (3) rebuild-from-PG if Redis ever
+  loses data. Redis decides fast (no overdraft), PG records durably (the accounting),
+  and a job reconciles the two. Crucially, **this is the same proven pattern we already
+  run for the provider-account `system_balance`** — the Redis `system_balance` chain:
+  an atomic Redis running balance, with PG converging after commit via a buffer/flush
+  job and a PG-lock fallback on any Redis error. Extending it to a hot wallet reuses
+  battle-tested mechanics rather than inventing new ones.
+
+**A reality check, because it matters.** A single wallet doing >10,000 TPS is
+extreme to the point of being unrealistic — that is more payment volume than entire
+countries push through one account. Real high-volume merchants spread their traffic
+over time, and what actually matters is the *platform* aggregate, which sharding
+solves. So: sharding handles ~99.9% of cases; techniques (b) and (c) are a **targeted**
+fix you apply only to a specific hot wallet — behind a per-wallet flag (like the
+existing `is_hot` / hot-wallet batcher), always with a fallback to the PG lock — and
+**never** to all wallets.
+
+| Need | Solution |
+|------|----------|
+| Platform > 10,000 TPS | Shard by `company_id` (different wallets on different shards) |
+| Single wallet pay-in > 5,000 TPS | Ledger counter-sharding on the append-only credit path (rare) |
+| Single wallet pay-out > 2,000 TPS | Balance buckets (sharded counter) or Redis atomic reservation |
+| Single wallet > 10,000 TPS | Extreme/unrealistic — targeted per-wallet fix only if it ever happens |
+
 ---
 
 ## 8. Principles
