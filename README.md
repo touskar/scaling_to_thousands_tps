@@ -1,6 +1,6 @@
 # Designing a Payment Platform That Handles More Daily Transactions Than Stripe and PayPal
 
-### How a single-writer Go + PostgreSQL gateway reached a measured 5,337 pay-in TPS — and what every wall along the way actually taught us
+### How a Go payment gateway, running on a single PostgreSQL writer (one primary database), reached a measured 5,337 pay-in TPS — and what every wall along the way actually taught us
 
 **Moussa Ndour — Infrastructure Engineer**
 
@@ -595,6 +595,37 @@ This asymmetry is why pay-in eventually reached 5,337 while a single hot wallet'
 pay-out is bounded by its overdraft lock. It is a *correctness* requirement, not an
 inefficiency.
 
+**Why a credit is allowed to skip the lock — and what it would cost us if it
+didn't.** It is worth being explicit, because this single decision is the hinge the
+whole write-path story turns on. A credit only *adds* money, so the balance can only
+move **up**. No matter how many credits land on the same wallet at the same instant,
+none of them can produce an overdraft — an overdraft is, by definition, the balance
+going below zero, and adding money can never do that. The per-wallet advisory lock
+exists for exactly **one** reason: to stop two concurrent *debits* from both reading
+the same balance, both passing the `Available ≥ amount` check, and both subtracting —
+overdrawing the wallet. Credits have nothing to serialize against. So a credit takes
+no lock at all; it just appends a row to `ledger_entries` and returns.
+
+Now imagine we had *not* made that choice — that credits still did the classic
+`UPDATE wallets SET balance = balance + :amount` on every pay-in. Every credit would
+take the row's write lock and update the **same** `wallets` row. Credits to one wallet
+would then serialize behind that row exactly the way debits do — a hot row — and
+because the platform's busiest wallets (the collection float, a large merchant) take
+the most pay-ins, the busiest path on the platform would be the most contended. That
+is precisely the **~55 TPS** ceiling that started this whole effort: pay-in to a busy
+wallet would collapse to a few hundred per second. And here is the part that makes the
+trade-off one-sided: locking a credit buys **zero** correctness. A credit cannot
+overdraw, so the lock guards against nothing. We would be paying the full price of
+serialization — the hot row, the lost throughput — for no safety in return. Locking
+credits is pure loss.
+
+That is the mechanical reason the two paths have the ceilings they do. Pay-in is
+**lock-free, so it contends with nothing and runs straight into the writer wall at
+5,337** — the limit is the database's raw insert/WAL throughput, nothing softer.
+Pay-out **must serialize debits per wallet to prevent overdraft**, so on a single hot
+wallet it caps lower (~1,100–2,000 with the batcher) — not because the code is slower,
+but because correctness forbids the parallelism that pay-in is free to use.
+
 **Proven under load.** 300 concurrent pay-ins produced 300 `credit` entries (exact
 sum), but `wallets.n_tup_upd` increased by **5**, not 300 — the fold ticked five
 times over 84 seconds; the per-transaction balance UPDATE was eliminated. A
@@ -1002,6 +1033,85 @@ spreading the keys would cost read locality (it would for us), **batch the inser
 so the per-row lock/flush cost is amortized. And: if N× the keys gives ≪N× the
 throughput, your contention is **global**, not per-key — look at the shared
 structures (PK leaf, WAL), not the entity.
+
+#### Operation by operation: what actually blocks at the ~5,000 TPS wall
+
+It helps to stop talking about "the wall" abstractly and trace, write by write,
+what each operation does and which resource it collides with. When I did that, the
+~5k ceiling stopped being mysterious. It is not one wall — it is **three serialized
+resources of a single PostgreSQL writer**, and every money operation funnels through
+all three.
+
+**1. The WAL (Write-Ahead Log) — one serial stream.** Every INSERT and UPDATE is
+first written to the WAL before it touches a data page; that is what makes it
+durable. There is exactly **one WAL per writer**, and to append a record each backend
+takes the internal `LWLock:WALInsert`. At ~5,000 transactions per second with ~6
+writes each, that is ≈ **30,000 WAL records/second** all contending for one lock. The
+lock itself becomes the bottleneck long before the disk does.
+
+**2. COMMIT (durable flush) — a bounded commit rate.** Each COMMIT must durably flush
+the WAL. On Aurora "flush" does not mean a local fsync — it means **send the WAL to
+the distributed storage layer and wait for a 4-of-6 quorum ACK**, a network
+round-trip. That round-trip puts a hard cap on commits/second no matter how much CPU
+the writer has spare.
+
+**3. The rightmost btree leaf — `LWLock:BufferContent`.** Because UUID v7 keys are
+monotonically increasing, every INSERT lands on the **same rightmost page** of each
+index. Inserts contend on that one page's buffer-content latch and serialize. This is
+exactly what `pg_stat_activity` showed: the dominant waits were
+`LWLock:BufferContent` + `LWLock:WALInsert`, with the writer's CPU *not* saturated —
+the signature of contention, not compute.
+
+**Pay-in — what it writes, and what blocks it.** Per transaction, split across
+gateway-api (init) and the worker (settle):
+
+```
+init:   INSERT transactions (PENDING)
+        INSERT registries (merchant_reference, idempotency)
+        UPDATE transactions -> DISPATCHED        (status CAS)
+settle: UPDATE transactions -> SUCCESS           (status CAS)
+        INSERT ledger_entries (credit)
+        INSERT provider_statements
+```
+
+Pay-in is **lock-free**: a credit cannot overdraw, so there is no per-wallet lock on
+the path. That means pay-in never hits a *business* lock at all — it hits only the
+three writer resources above (WAL + commit rate + the hot btree leaf). This is
+precisely why the batcher is so effective on pay-in: grouping N inserts into **one
+multi-row INSERT** amortizes all three at once — fewer WAL records, fewer commits,
+fewer leaf-latch acquisitions. That is the change that took pay-in from ~2,000 to the
+measured **5,337**.
+
+**Pay-out — what it writes, and why it caps lower (4,150).** Pay-out does everything
+pay-in does *plus* three extra operations at init, because a debit can overdraw:
+
+```
+init:   pg_advisory_xact_lock(wallet_id)          -- held from start to COMMIT
+        read Available = folded balance + Σ ledger tail
+        overdraft check
+        INSERT transactions
+        INSERT provider_statements
+        INSERT ledger_entries (reservation, -amount)
+```
+
+Two distinct effects fall out of this:
+
+- **A single hot wallet serializes on its advisory lock** — two debits cannot both
+  pass the overdraft check and overdraw the same wallet, so they line up
+  (~1,100–2,000/wallet with the batcher). That is a *per-wallet* limit.
+- **At platform scale across many wallets, the lock is *not* the cap** — different
+  wallets are different locks, so they don't contend with each other. The cap is the
+  **same single writer** (WAL + commit rate + hot leaf) that pay-in hits. But because
+  pay-out does *more work per transaction* (take the lock, read `Available`, write the
+  extra reservation entry), it reaches that shared writer wall a little earlier —
+  **4,150 vs 5,337**.
+
+So both operations die against the **same wall: one writer = one WAL + one commit
+rate + one hot btree leaf** (the monotonic-key hotspot). Pay-out just arrives there
+sooner because each of its transactions is heavier. The batcher exists precisely to
+cut the count of WAL records, commits, and leaf-latch acquisitions by grouping
+writes — and once you've done that, the only way past ~5k is **more writers**, which
+is sharding.
 
 ### J7 — The unified transaction-write batcher
 
@@ -1484,6 +1594,168 @@ OpenSearch** (CDC), so sharding the *write* path doesn't break aggregates. Shard
 is well-understood, deferred, and explicitly out of scope here — but the runway is
 built.
 
+#### Why the codebase is ready for sharding (with code)
+
+The reason I can call sharding "deferred, not scary" is structural, and worth showing
+concretely. **Every database access in the entire codebase flows through two
+functions.** So sharding touches roughly *two functions* — not the hundreds of call
+sites that actually issue queries.
+
+But there is a deeper reason this is low-risk: a `ShardResolver` is **not a new
+concept** for this codebase. The resolve-by-key, look-it-up-in-a-registry pattern is
+already pervasive — it is how several of the hottest paths already work — so adding
+one more resolver is the team applying a pattern it is already fluent in, not learning
+a new one.
+
+- **The payment-provider layer already resolves dynamically.** Which provider
+  implementation handles a transaction is looked up at runtime from a registry,
+  `ProviderRegistry map[string]PaymentProvider` keyed by provider code, and *which*
+  provider/method config to use is resolved per company by
+  `resolveConfig(companyID, paymentMethodID)` (company-specific override, falling back
+  to the method default). That is already a `companyID → concrete dependency` lookup —
+  structurally identical to `companyID → *gorm.DB`.
+- **The read path already resolves a *source* dynamically.** `determineReadSource(date_from, date_to)`
+  picks PostgreSQL vs OpenSearch for every list query, per request, from the date
+  range. The code already accepts that "where does this query go?" is a runtime
+  decision made by a small resolver — a `ShardResolver` answers the same kind of
+  question with a different key.
+- **The database is already injected through a single seam.** It is wired once at
+  startup — `txManager := NewTransactionManager(db)` — and every repository reads its
+  handle through `GetDB(ctx, r.db)`. There is no `*gorm.DB` constructed anywhere else;
+  the connection is a dependency, resolved through one indirection, exactly where a
+  shard-aware resolver slots in.
+
+So a `ShardResolver` (`company_id → *gorm.DB`) is the **exact same registry/resolver
+indirection the codebase already relies on everywhere** — provider registry, read-source
+selection, the injected DB seam. It is not a new architectural concept; it is the
+proven one, applied to one more key.
+
+Every repository method gets its handle from one helper. There is no `r.db` used
+directly anywhere; a repo always asks for the context-aware DB first (from, e.g.,
+`ledger_entry_repository.go`):
+
+```go
+func (r *GormLedgerEntryRepository) Append(ctx context.Context, entry *LedgerEntry) error {
+    db := gormPkg.GetDB(ctx, r.db)        // every repo does this
+    return db.WithContext(ctx).Create(model).Error
+}
+```
+
+That `GetDB` is the single read choke point
+(`internal/shared/infrastructure/persistence/gorm/transaction_manager.go`):
+
+```go
+func GetDB(ctx context.Context, fallback *gorm.DB) *gorm.DB {
+    if tx, ok := ctx.Value(txKey).(*gorm.DB); ok {
+        return tx
+    }
+    return fallback
+}
+```
+
+And every write is bounded by the single transaction boundary:
+
+```go
+func (m *GormTransactionManager) WithTransaction(ctx context.Context, fn func(context.Context) error) error {
+    return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        txCtx := context.WithValue(ctx, txKey, tx)
+        return fn(txCtx)
+    })
+}
+```
+
+That's the whole surface. Here is the entire sharded migration — one small resolver
+plus three edits:
+
+```go
+// A. a tiny resolver (new)
+type ShardResolver struct {
+    shards    []*gorm.DB                     // N pools, one per shard
+    directory func(companyID uuid.UUID) int  // company_id -> shard index
+}
+func (s *ShardResolver) For(ctx context.Context) *gorm.DB {
+    return s.shards[s.directory(CompanyIDFromContext(ctx))]
+}
+
+// B. GetDB becomes shard-aware (3 new lines)
+func GetDB(ctx context.Context, fallback *gorm.DB) *gorm.DB {
+    if tx, ok := ctx.Value(txKey).(*gorm.DB); ok {
+        return tx                            // inside a tx = already the right shard
+    }
+    if db := shardResolver.For(ctx); db != nil {
+        return db                            // route by company_id
+    }
+    return fallback
+}
+
+// C. WithTransaction opens the tx on the right shard (1 changed line)
+func (m *GormTransactionManager) WithTransaction(ctx, fn) error {
+    db := m.shardResolver.For(ctx)           // was: m.db
+    return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        return fn(context.WithValue(ctx, txKey, tx))
+    })
+}
+
+// D. set company_id in context at the auth middleware (1 line, after api_key->company)
+ctx = WithCompanyID(ctx, company.ID)
+```
+
+The most important thing about that diff is what is **not** in it. Spelling it out
+exactly:
+
+- **The hundreds of repository methods do not change.** Every one of them already
+  ends in `db := gormPkg.GetDB(ctx, r.db)` before issuing its query (the `Append`
+  above is one of many — the same line opens every `Find`, `Create`, `Update`).
+  Once `GetDB` is shard-aware, every repo follows automatically. Not one repository
+  file is touched.
+- **The use cases do not change.** A use case never sees a `*gorm.DB`; it orchestrates
+  through `txManager.WithTransaction(ctx, …)` and the injected repository interfaces.
+  Once `WithTransaction` opens its tx on the resolved shard, every use case is sharded
+  without a single edit.
+- **Only ~3 things change**, and they are all plumbing:
+  1. the new `ShardResolver` (block A — brand new, ~6 lines);
+  2. the two seam functions, `GetDB` and `WithTransaction` (blocks B and C — 3 new
+     lines and 1 changed line respectively);
+  3. one middleware line that puts `company_id` into the context (block D).
+
+That is the entire surface area. The call sites that actually issue queries — the part
+that *looks* like the work — are inert. Now, why that small diff is *sufficient*:
+everything that makes it work was already a foundational decision, made for other
+reasons, that happens to pay off here:
+
+| What was already in place | Why it makes sharding simple |
+|---|---|
+| `GetDB(ctx, r.db)` in every repo | One reroute point — change one function, every query follows |
+| `WithTransaction` is the single tx boundary | One place to open the tx on the right shard |
+| **UUID v7** everywhere (no auto-increment) | IDs are globally unique → no PK collision across shards |
+| `company_id` on every entity | The natural shard key is already present on every row |
+| Reads already on **OpenSearch** | Cross-shard aggregation is already solved — sharding writes doesn't break BO analytics |
+| Repos are **interfaces injected at `main.go`** | Swap the injection, not the call sites |
+| Registries **hash-partitioned per company** | They travel with their company onto the same shard |
+
+So the migration is, end to end: **~1 resolver + 2 modified functions + 1 middleware
+line.** The hundreds of repositories and use cases are untouched. That is the payoff
+of strict dependency inversion — the discipline that felt like overhead while writing
+it is exactly what turns a terrifying re-platforming into a one-afternoon diff.
+
+**So why didn't we just do it?** Because the structure was built for it, going
+multi-shard is genuinely two things: (a) provision the infrastructure — stand up N
+Aurora clusters, the per-shard proxies, the directory — and (b) change the handful of
+lines above (the resolver, the two seams, the one middleware line). Realistically that
+is **about half a day of engineering**, plus the infrastructure provisioning and the
+data cutover — not a rewrite, not a re-architecture.
+
+And we **deliberately did not do it.** At ~5,337 pay-in and ~4,150 pay-out TPS, a
+single cluster already processes more *daily* volume than Stripe's record day — and
+far more than the typical daily volume either Stripe or PayPal handles. There was no
+business case to take on the cost and operational complexity of running multiple
+database clusters to serve traffic that does not exist. So I built and documented the
+runway and stopped at its edge: the capability is real, it is proven, and it can be
+pulled in a day if a workload ever genuinely demands it. That is the engineering
+judgment I want to stand behind — **build the capability, don't pay for capacity you
+don't need.** Premature sharding is just premature optimization wearing a bigger
+invoice.
+
 A note on pay-out: a *single* wallet is bounded by its overdraft lock (~1,100–2,000
 TPS with the batcher) **regardless of sharding**, by design — the reservation is an
 authorization hold so we never instruct the PSP to disburse funds the merchant
@@ -1643,4 +1915,3 @@ internalize them and most of this article reproduces itself.
 inherits the reasoning, not just the final state.*
 
 **— Moussa Ndour, Infrastructure Engineer**
-macbookpro@192 nexusypay % 
